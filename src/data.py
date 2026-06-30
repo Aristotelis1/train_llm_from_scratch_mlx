@@ -37,32 +37,83 @@ class CharTokenizer:
         return "".join(self.itos[int(i)] for i in ids)
 
 
-class DataLoader:
-    """Loads the corpus, encodes it, splits train/val, and yields batches."""
+class BPETokenizer:
+    """GPT-2 byte-pair tokenizer (vocab 50257) via tiktoken.
 
-    def __init__(self, context_length, batch_size, val_frac=0.1):
+    Same interface as CharTokenizer so the DataLoader/model don't care which
+    one is in use. This is the real GPT-2 vocabulary, so a model trained with
+    it is genuinely a GPT-2-family model rather than a char-level toy.
+    """
+
+    def __init__(self, _text=None):
+        import tiktoken
+
+        self._enc = tiktoken.get_encoding("gpt2")
+        self.vocab_size = self._enc.n_vocab  # 50257
+
+    def encode(self, s):
+        # allow the special <|endoftext|> token through if present
+        return self._enc.encode(s, allowed_special="all")
+
+    def decode(self, ids):
+        return self._enc.decode([int(i) for i in ids])
+
+
+TOKENIZERS = {"char": CharTokenizer, "bpe": BPETokenizer}
+
+
+class DataLoader:
+    """Loads the corpus, encodes it, splits train/val, and yields batches.
+
+    Token ids are pre-encoded once (and cached to disk for BPE, which is the
+    slow part) so every training step is a cheap on-device gather.
+    """
+
+    def __init__(self, context_length, batch_size, tokenizer="bpe", val_frac=0.1):
         text = download()
-        self.tokenizer = CharTokenizer(text)
+        tok_name = tokenizer
+        self.tokenizer = TOKENIZERS[tok_name](text)
         self.context_length = context_length
         self.batch_size = batch_size
 
-        data = mx.array(self.tokenizer.encode(text), dtype=mx.int32)
+        ids = self._encode_cached(text, tok_name)
+        data = mx.array(ids, dtype=mx.int32)
         n = int(len(data) * (1 - val_frac))
         self.train_data = data[:n]
         self.val_data = data[n:]
 
+    def _encode_cached(self, text, tok_name):
+        """Encode the corpus once, caching the token ids to a .npy file.
+
+        BPE encoding of ~1M chars takes a moment; caching makes re-runs instant.
+        The cache key includes the tokenizer name so char/bpe don't collide.
+        """
+        cache = os.path.join(DATA_DIR, f"tokens_{tok_name}.npy")
+        if os.path.exists(cache):
+            return mx.load(cache)
+        print(f"Tokenizing corpus with '{tok_name}' tokenizer ...")
+        ids = mx.array(self.tokenizer.encode(text), dtype=mx.int32)
+        mx.save(cache, ids)
+        return ids
+
     def get_batch(self, split):
-        """Return (x, y) where y is x shifted one token to the right."""
+        """Return (x, y) where y is x shifted one token to the right.
+
+        Fully vectorized: sample B start offsets, build a (B, T+1) index matrix
+        with broadcasting, gather once, then split into inputs/targets. No
+        Python loop and no host sync (unlike a list-comprehension + .tolist()).
+        """
         data = self.train_data if split == "train" else self.val_data
-        max_start = len(data) - self.context_length - 1
-        ix = mx.random.randint(0, max_start, (self.batch_size,)).tolist()
-        x = mx.stack([data[i : i + self.context_length] for i in ix])
-        y = mx.stack([data[i + 1 : i + 1 + self.context_length] for i in ix])
-        return x, y
+        T = self.context_length
+        max_start = data.size - T - 1
+        starts = mx.random.randint(0, max_start, (self.batch_size, 1))
+        idx = starts + mx.arange(T + 1)[None, :]  # (B, T+1)
+        chunk = data[idx]                          # (B, T+1)
+        return chunk[:, :-1], chunk[:, 1:]
 
 
 if __name__ == "__main__":
-    loader = DataLoader(context_length=128, batch_size=4)
+    loader = DataLoader(context_length=128, batch_size=4, tokenizer="bpe")
     print("vocab_size:", loader.tokenizer.vocab_size)
     print("train tokens:", loader.train_data.size, "val tokens:", loader.val_data.size)
     x, y = loader.get_batch("train")
