@@ -33,6 +33,7 @@ def main():
     # Sample from a saved checkpoint, using the active training preset.
     from .data import DataLoader
     from .model import Transformer
+    from .quantize import load_quantized
     from .train import CONFIG, PRESETS, DTYPES, CHECKPOINT
 
     cfg = PRESETS[CONFIG]
@@ -43,7 +44,9 @@ def main():
     )
     if DTYPES[cfg["dtype"]] != mx.float32:
         model.set_dtype(DTYPES[cfg["dtype"]])
-    model.load_weights(CHECKPOINT)
+    # load_quantized transparently handles both plain and quantized checkpoints
+    # (it inspects the file metadata and rebuilds the quantized sub-modules).
+    load_quantized(model, CHECKPOINT)
     print(generate(model, loader.tokenizer, max_new_tokens=1000,
                    context_length=cfg["context_length"]))
 
