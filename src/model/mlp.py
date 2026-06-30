@@ -10,7 +10,7 @@ class MLP(nn.Module):
 
     def __call__(self, x):
         x = self.fc1(x)
-        x = nn.relu(x)
+        x = nn.gelu(x)
         x = self.fc2(x)
         x = self.dropout(x)
         return x

@@ -8,6 +8,7 @@ class MultiHeadAttention(nn.Module):
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
+        self.scale = self.d_k ** -0.5
 
         # One projection each for Q, K, V across all heads at once.
         self.W_q = nn.Linear(d_model, d_model)
@@ -15,30 +16,39 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
 
-        self.attn_dropout = nn.Dropout(dropout)  # on attention weights
-        self.dropout = nn.Dropout(dropout)       # on the output projection
+        self.dropout = nn.Dropout(dropout)  # on the output projection
 
     def _split_heads(self, t, B, T):
         # (B, T, d_model) -> (B, num_heads, T, d_k)
         return t.reshape(B, T, self.num_heads, self.d_k).transpose(0, 2, 1, 3)
 
-    def __call__(self, x):
+    def __call__(self, x, return_weights=False):
         B, T, C = x.shape
 
         Q = self._split_heads(self.W_q(x), B, T)
         K = self._split_heads(self.W_k(x), B, T)
         V = self._split_heads(self.W_v(x), B, T)
 
-        # (B, num_heads, T, T)
-        scores = mx.matmul(Q, mx.swapaxes(K, -2, -1)) / (self.d_k ** 0.5)
-        mask = mx.tril(mx.ones((T, T)))
-        scores = mx.where(mask == 0, -mx.inf, scores)
-        attention_weights = mx.softmax(scores, axis=-1)
+        if return_weights:
+            # Explicit path: materialize the (B, num_heads, T, T) attention
+            # weights so they can be inspected/visualized. Costly in memory at
+            # long context, so it's opt-in and off during training.
+            scores = mx.matmul(Q, mx.swapaxes(K, -2, -1)) * self.scale
+            mask = mx.tril(mx.ones((T, T)))
+            scores = mx.where(mask == 0, -mx.inf, scores)
+            weights = mx.softmax(scores, axis=-1)
+            out = mx.matmul(weights, V)
+        else:
+            # Fused, flash-style attention. Never materializes the T x T tensor,
+            # which is the single biggest memory term at GPT-2 context lengths.
+            out = mx.fast.scaled_dot_product_attention(
+                Q, K, V, scale=self.scale, mask="causal"
+            )
+            weights = None
 
-        out = mx.matmul(self.attn_dropout(attention_weights), V)  # (B, num_heads, T, d_k)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)          # merge heads
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)  # merge heads
         out = self.dropout(self.W_o(out))
-        return out, attention_weights
+        return (out, weights) if return_weights else out
 
 
 if __name__ == "__main__":
@@ -50,7 +60,8 @@ if __name__ == "__main__":
 
     attention_layer = MultiHeadAttention(d_model, num_heads)
     x = mx.random.normal((batch_size, seq_length, d_model))
-    output, attention_weights = attention_layer(x)
-
+    output = attention_layer(x)
     print("Output shape:", output.shape)
+
+    output, attention_weights = attention_layer(x, return_weights=True)
     print("Attention weights shape (B, num_heads, T, T):", attention_weights.shape)
